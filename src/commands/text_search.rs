@@ -6,8 +6,7 @@ use serde_json::{Value, json};
 
 const API_URL: &str = "https://places.googleapis.com/v1/places:searchText";
 
-const DEFAULT_FIELD_MASK: &str =
-    "places.displayName,places.formattedAddress,places.rating,places.types,places.websiteUri";
+const DEFAULT_FIELD_MASK: &str = "places.displayName,places.formattedAddress,places.rating,places.userRatingCount,places.priceLevel,places.types,places.websiteUri,nextPageToken";
 
 #[derive(ClapArgs, Debug)]
 pub struct Args {
