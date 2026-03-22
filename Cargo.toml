@@ -1,0 +1,12 @@
+[package]
+name = "maps-cli"
+version = "0.1.0"
+edition = "2024"
+description = "CLI for Google Maps APIs (Places, Text Search, and more)"
+
+[dependencies]
+anyhow = "1.0"
+clap = { version = "4.5", features = ["derive", "env"] }
+reqwest = { version = "0.12", default-features = false, features = ["blocking", "json", "rustls-tls"] }
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"
