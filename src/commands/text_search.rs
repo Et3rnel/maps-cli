@@ -1,12 +1,10 @@
 use anyhow::{Context, Result};
 use clap::Args as ClapArgs;
 use reqwest::blocking::Client;
-use serde::Deserialize;
-use serde_json::{Value, json};
 
-const API_URL: &str = "https://places.googleapis.com/v1/places:searchText";
+use crate::google_places::{place_details, text_search as api};
 
-const DEFAULT_FIELD_MASK: &str = "places.displayName,places.formattedAddress,places.rating,places.userRatingCount,places.priceLevel,places.types,places.websiteUri,nextPageToken";
+const DEFAULT_REVIEWS_TOP: usize = 5;
 
 #[derive(ClapArgs, Debug)]
 pub struct Args {
@@ -58,35 +56,21 @@ pub struct Args {
     #[arg(long)]
     pub page_token: Option<String>,
 
-    /// Output raw JSON instead of formatted text
-    #[arg(long, default_value_t = false)]
-    pub json: bool,
-}
+    /// Fetch Google reviews for the first results
+    #[arg(long, visible_alias = "with-reviews", default_value_t = false)]
+    pub reviews: bool,
 
-#[derive(Deserialize, Debug)]
-#[serde(rename_all = "camelCase")]
-struct TextSearchResponse {
-    #[serde(default)]
-    places: Vec<Place>,
-    next_page_token: Option<String>,
-}
+    /// Limit review lookups to the first N places (default: 5)
+    #[arg(long, requires = "reviews", value_name = "N", value_parser = parse_reviews_top)]
+    pub reviews_top: Option<usize>,
 
-#[derive(Deserialize, Debug)]
-#[serde(rename_all = "camelCase")]
-struct Place {
-    display_name: Option<DisplayName>,
-    formatted_address: Option<String>,
-    rating: Option<f64>,
-    user_rating_count: Option<u32>,
-    types: Option<Vec<String>>,
-    website_uri: Option<String>,
-    price_level: Option<String>,
-}
+    /// Only fetch reviews for places with rating >= this value
+    #[arg(long, requires = "reviews")]
+    pub reviews_min_rating: Option<f64>,
 
-#[derive(Deserialize, Debug)]
-#[serde(rename_all = "camelCase")]
-struct DisplayName {
-    text: String,
+    /// Only fetch reviews for places with at least this many ratings
+    #[arg(long, requires = "reviews")]
+    pub reviews_min_count: Option<u32>,
 }
 
 pub fn run(api_key: &str, args: &Args) -> Result<()> {
@@ -94,157 +78,128 @@ pub fn run(api_key: &str, args: &Args) -> Result<()> {
         .build()
         .context("failed to build HTTP client")?;
 
-    let body = build_request_body(args);
-    let field_mask = args.fields.as_deref().unwrap_or(DEFAULT_FIELD_MASK);
+    let body = api::build_request_body(api::TextSearchParams {
+        query: &args.query,
+        language: &args.language,
+        page_size: args.page_size,
+        included_type: args.included_type.as_deref(),
+        open_now: args.open_now,
+        min_rating: args.min_rating,
+        price_levels: args.price_levels.as_deref(),
+        rank_preference: args.rank_preference.as_deref(),
+        region_code: args.region_code.as_deref(),
+        location_bias: args.location_bias.as_deref(),
+        page_token: args.page_token.as_deref(),
+    });
 
-    let response = client
-        .post(API_URL)
-        .header("Content-Type", "application/json")
-        .header("X-Goog-Api-Key", api_key)
-        .header("X-Goog-FieldMask", field_mask)
-        .json(&body)
-        .send()
-        .context("failed to call Google Places API")?
-        .error_for_status()
-        .context("Google Places API request failed")?;
+    let field_mask = build_search_field_mask(args);
+    let mut result = api::fetch(&client, api_key, body, &field_mask)?;
 
-    if args.json {
-        let raw: Value = response.json().context("failed to parse response")?;
-        println!("{}", serde_json::to_string_pretty(&raw)?);
-    } else {
-        let result: TextSearchResponse = response.json().context("failed to parse response")?;
-        render_output(&result);
+    if args.reviews {
+        enrich_places_with_reviews(&client, api_key, args, &mut result.places);
     }
+
+    println!("{}", serde_json::to_string_pretty(&result)?);
 
     Ok(())
 }
 
-fn build_request_body(args: &Args) -> Value {
-    let mut body = json!({
-        "textQuery": args.query,
-        "languageCode": args.language,
-    });
-
-    let obj = body.as_object_mut().unwrap();
-
-    if let Some(page_size) = args.page_size {
-        obj.insert("pageSize".to_string(), json!(page_size));
+fn build_search_field_mask(args: &Args) -> String {
+    match args.fields.as_deref() {
+        Some(field_mask) if args.reviews => ensure_field_in_mask(field_mask, "places.id"),
+        Some(field_mask) => field_mask.to_string(),
+        None if args.reviews => ensure_field_in_mask(api::default_field_mask(), "places.id"),
+        None => api::default_field_mask().to_string(),
     }
+}
 
-    if let Some(ref included_type) = args.included_type {
-        obj.insert("includedType".to_string(), json!(included_type));
+fn ensure_field_in_mask(field_mask: &str, required_field: &str) -> String {
+    let has_field = field_mask
+        .split(',')
+        .map(str::trim)
+        .any(|field| field == required_field);
+
+    if has_field {
+        field_mask.to_string()
+    } else {
+        format!("{field_mask},{required_field}")
     }
+}
 
-    if args.open_now {
-        obj.insert("openNow".to_string(), json!(true));
+fn parse_reviews_top(input: &str) -> Result<usize, String> {
+    let value = input
+        .parse::<usize>()
+        .map_err(|_| format!("invalid value '{input}': expected a positive integer"))?;
+
+    if value == 0 {
+        Err("reviews top must be greater than 0".to_string())
+    } else {
+        Ok(value)
     }
+}
 
-    if let Some(min_rating) = args.min_rating {
-        obj.insert("minRating".to_string(), json!(min_rating));
-    }
+fn enrich_places_with_reviews(
+    client: &Client,
+    api_key: &str,
+    args: &Args,
+    places: &mut [api::Place],
+) {
+    let limit = args
+        .reviews_top
+        .unwrap_or(DEFAULT_REVIEWS_TOP)
+        .min(places.len());
 
-    if let Some(ref price_levels) = args.price_levels {
-        obj.insert("priceLevels".to_string(), json!(price_levels));
-    }
-
-    if let Some(ref rank_preference) = args.rank_preference {
-        obj.insert("rankPreference".to_string(), json!(rank_preference));
-    }
-
-    if let Some(ref region_code) = args.region_code {
-        obj.insert("regionCode".to_string(), json!(region_code));
-    }
-
-    if let Some(ref location_bias) = args.location_bias
-        && let Some(circle) = parse_location_bias(location_bias)
+    for place in places
+        .iter_mut()
+        .filter(|place| should_fetch_reviews(place, args))
+        .take(limit)
     {
-        obj.insert("locationBias".to_string(), circle);
-    }
+        let Some(place_id) = place.id.as_deref() else {
+            eprintln!("warning: skipping review lookup for a result without a place id");
+            continue;
+        };
 
-    if let Some(ref page_token) = args.page_token {
-        obj.insert("pageToken".to_string(), json!(page_token));
+        match place_details::fetch_reviews(client, api_key, place_id) {
+            Ok(reviews) => {
+                place.reviews = reviews;
+                place.reviews_fetched = true;
+            }
+            Err(err) => {
+                let name = place
+                    .display_name
+                    .as_ref()
+                    .map(|display_name| display_name.text.as_str())
+                    .unwrap_or(place_id);
+                eprintln!("warning: failed to fetch reviews for {name}: {err:#}");
+            }
+        }
     }
-
-    body
 }
 
-fn parse_location_bias(input: &str) -> Option<Value> {
-    let parts: Vec<&str> = input.split(',').collect();
-    if parts.len() != 3 {
-        eprintln!("warning: --location-bias must be lat,lng,radius (e.g. 48.8566,2.3522,500)");
-        return None;
+fn should_fetch_reviews(place: &api::Place, args: &Args) -> bool {
+    if let Some(min_rating) = args.reviews_min_rating
+        && place.rating.is_none_or(|rating| rating < min_rating)
+    {
+        return false;
     }
 
-    let lat: f64 = parts[0].trim().parse().ok()?;
-    let lng: f64 = parts[1].trim().parse().ok()?;
-    let radius: f64 = parts[2].trim().parse().ok()?;
-
-    Some(json!({
-        "circle": {
-            "center": {
-                "latitude": lat,
-                "longitude": lng,
-            },
-            "radius": radius,
-        }
-    }))
-}
-
-fn render_output(result: &TextSearchResponse) {
-    if result.places.is_empty() {
-        println!("No places found.");
-        return;
+    if let Some(min_count) = args.reviews_min_count
+        && place
+            .user_rating_count
+            .is_none_or(|count| count < min_count)
+    {
+        return false;
     }
 
-    for (i, place) in result.places.iter().enumerate() {
-        let name = place
-            .display_name
-            .as_ref()
-            .map(|d| d.text.as_str())
-            .unwrap_or("(unknown)");
-
-        println!("{}. {}", i + 1, name);
-
-        if let Some(ref address) = place.formatted_address {
-            println!("   Address: {address}");
-        }
-
-        if let Some(rating) = place.rating {
-            let count = place.user_rating_count.unwrap_or(0);
-            println!("   Rating:  {rating}/5 ({count} reviews)");
-        }
-
-        if let Some(ref price) = place.price_level {
-            let display = price.strip_prefix("PRICE_LEVEL_").unwrap_or(price);
-            println!("   Price:   {display}");
-        }
-
-        if let Some(ref types) = place.types {
-            let display: Vec<&str> = types.iter().take(5).map(|t| t.as_str()).collect();
-            println!("   Types:   {}", display.join(", "));
-        }
-
-        if let Some(ref uri) = place.website_uri {
-            println!("   Website: {uri}");
-        }
-
-        if i < result.places.len() - 1 {
-            println!();
-        }
-    }
-
-    if let Some(ref token) = result.next_page_token {
-        println!("\n--- More results available. Use --page-token '{token}' to see the next page.");
-    }
+    true
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
 
-    #[test]
-    fn build_request_body_minimal() {
-        let args = Args {
+    fn make_args() -> Args {
+        Args {
             query: "pizza in Paris".to_string(),
             language: "fr".to_string(),
             page_size: None,
@@ -257,10 +212,30 @@ mod tests {
             location_bias: None,
             fields: None,
             page_token: None,
-            json: false,
-        };
+            reviews: false,
+            reviews_top: None,
+            reviews_min_rating: None,
+            reviews_min_count: None,
+        }
+    }
 
-        let body = build_request_body(&args);
+    #[test]
+    fn build_request_body_minimal() {
+        let args = make_args();
+        let body = api::build_request_body(api::TextSearchParams {
+            query: &args.query,
+            language: &args.language,
+            page_size: args.page_size,
+            included_type: args.included_type.as_deref(),
+            open_now: args.open_now,
+            min_rating: args.min_rating,
+            price_levels: args.price_levels.as_deref(),
+            rank_preference: args.rank_preference.as_deref(),
+            region_code: args.region_code.as_deref(),
+            location_bias: args.location_bias.as_deref(),
+            page_token: args.page_token.as_deref(),
+        });
+
         assert_eq!(body["textQuery"], "pizza in Paris");
         assert_eq!(body["languageCode"], "fr");
         assert!(body.get("pageSize").is_none());
@@ -269,23 +244,31 @@ mod tests {
 
     #[test]
     fn build_request_body_with_options() {
-        let args = Args {
-            query: "restaurant".to_string(),
-            language: "en".to_string(),
-            page_size: Some(5),
-            included_type: Some("restaurant".to_string()),
-            open_now: true,
-            min_rating: Some(4.0),
-            price_levels: Some(vec!["PRICE_LEVEL_MODERATE".to_string()]),
-            rank_preference: Some("RELEVANCE".to_string()),
-            region_code: Some("us".to_string()),
-            location_bias: None,
-            fields: None,
-            page_token: None,
-            json: false,
-        };
+        let mut args = make_args();
+        args.query = "restaurant".to_string();
+        args.language = "en".to_string();
+        args.page_size = Some(5);
+        args.included_type = Some("restaurant".to_string());
+        args.open_now = true;
+        args.min_rating = Some(4.0);
+        args.price_levels = Some(vec!["PRICE_LEVEL_MODERATE".to_string()]);
+        args.rank_preference = Some("RELEVANCE".to_string());
+        args.region_code = Some("us".to_string());
 
-        let body = build_request_body(&args);
+        let body = api::build_request_body(api::TextSearchParams {
+            query: &args.query,
+            language: &args.language,
+            page_size: args.page_size,
+            included_type: args.included_type.as_deref(),
+            open_now: args.open_now,
+            min_rating: args.min_rating,
+            price_levels: args.price_levels.as_deref(),
+            rank_preference: args.rank_preference.as_deref(),
+            region_code: args.region_code.as_deref(),
+            location_bias: args.location_bias.as_deref(),
+            page_token: args.page_token.as_deref(),
+        });
+
         assert_eq!(body["pageSize"], 5);
         assert_eq!(body["includedType"], "restaurant");
         assert_eq!(body["openNow"], true);
@@ -296,7 +279,7 @@ mod tests {
 
     #[test]
     fn parse_location_bias_valid() {
-        let result = parse_location_bias("48.8566,2.3522,500").unwrap();
+        let result = api::parse_location_bias("48.8566,2.3522,500").unwrap();
         assert_eq!(result["circle"]["center"]["latitude"], 48.8566);
         assert_eq!(result["circle"]["center"]["longitude"], 2.3522);
         assert_eq!(result["circle"]["radius"], 500.0);
@@ -304,17 +287,86 @@ mod tests {
 
     #[test]
     fn parse_location_bias_invalid() {
-        assert!(parse_location_bias("invalid").is_none());
-        assert!(parse_location_bias("48.8,2.3").is_none());
+        assert!(api::parse_location_bias("invalid").is_none());
+        assert!(api::parse_location_bias("48.8,2.3").is_none());
     }
 
     #[test]
-    fn render_output_empty() {
-        let result = TextSearchResponse {
-            places: vec![],
-            next_page_token: None,
+    fn build_search_field_mask_adds_place_id_for_reviews() {
+        let mut args = make_args();
+        args.reviews = true;
+
+        let field_mask = build_search_field_mask(&args);
+        assert!(field_mask.contains("places.id"));
+    }
+
+    #[test]
+    fn ensure_field_in_mask_does_not_duplicate_existing_field() {
+        let field_mask = ensure_field_in_mask("places.displayName,places.id", "places.id");
+        assert_eq!(field_mask, "places.displayName,places.id");
+    }
+
+    #[test]
+    fn should_fetch_reviews_respects_min_rating() {
+        let mut args = make_args();
+        args.reviews_min_rating = Some(4.4);
+
+        let place = api::Place {
+            id: Some("abc".to_string()),
+            display_name: None,
+            formatted_address: None,
+            rating: Some(4.3),
+            user_rating_count: Some(100),
+            types: None,
+            website_uri: None,
+            price_level: None,
+            reviews: None,
+            reviews_fetched: false,
         };
-        // Should not panic
-        render_output(&result);
+
+        assert!(!should_fetch_reviews(&place, &args));
+    }
+
+    #[test]
+    fn should_fetch_reviews_respects_min_count() {
+        let mut args = make_args();
+        args.reviews_min_count = Some(30);
+
+        let place = api::Place {
+            id: Some("abc".to_string()),
+            display_name: None,
+            formatted_address: None,
+            rating: Some(4.8),
+            user_rating_count: Some(12),
+            types: None,
+            website_uri: None,
+            price_level: None,
+            reviews: None,
+            reviews_fetched: false,
+        };
+
+        assert!(!should_fetch_reviews(&place, &args));
+    }
+
+    #[test]
+    fn should_fetch_reviews_allows_place_matching_thresholds() {
+        let mut args = make_args();
+        args.reviews_min_rating = Some(4.4);
+        args.reviews_min_count = Some(30);
+
+        let place = api::Place {
+            id: Some("abc".to_string()),
+            display_name: None,
+            formatted_address: None,
+            rating: Some(4.8),
+            user_rating_count: Some(120),
+            types: None,
+            website_uri: None,
+            price_level: None,
+            reviews: None,
+            reviews_fetched: false,
+        };
+
+        assert!(should_fetch_reviews(&place, &args));
     }
 }

@@ -1,4 +1,5 @@
 mod commands;
+mod google_places;
 
 use anyhow::{Result, bail};
 use clap::Parser;

@@ -33,11 +33,20 @@ maps-cli text-search "restaurant" --language fr --open-now --location-bias "48.8
 # Filter by type and minimum rating
 maps-cli text-search "bar in New York" --included-type bar --min-rating 4.0
 
-# Limit results and get raw JSON
-maps-cli text-search "coffee in London" --page-size 5 --json
+# Limit results
+maps-cli text-search "coffee in London" --page-size 5
 
 # Filter by price level
 maps-cli text-search "restaurant in Tokyo" --price-levels PRICE_LEVEL_INEXPENSIVE,PRICE_LEVEL_MODERATE
+
+# Enrich the first 5 results with Google reviews
+maps-cli text-search "dentist in Paris" --reviews
+
+# Enrich only the first 3 results with Google reviews
+maps-cli text-search "dentist in Paris" --reviews --reviews-top 3
+
+# Only fetch reviews for strong candidates
+maps-cli text-search "dentist in Paris" --reviews --reviews-min-rating 4.4 --reviews-min-count 30
 
 # Pagination
 maps-cli text-search "pizza in New York" --page-size 5
@@ -61,4 +70,14 @@ maps-cli text-search "pizza in New York" --page-size 5 --page-token "TOKEN_FROM_
 | `--location-bias` | Bias results to a circle: `lat,lng,radius` |
 | `--fields` | Custom field mask (overrides default) |
 | `--page-token` | Pagination token from previous response |
-| `--json` | Output raw JSON |
+| `--reviews`, `--with-reviews` | Fetch up to 5 Google reviews per place via Place Details |
+| `--reviews-top` | Limit review lookups to the first `N` places (default: `5`) |
+| `--reviews-min-rating` | Only fetch reviews for places with rating >= this value |
+| `--reviews-min-count` | Only fetch reviews for places with at least this many ratings |
+
+### Reviews
+
+- `--reviews` triggers extra Place Details calls only for the first results selected by `--reviews-top` and matching any review thresholds.
+- Google Places returns at most 5 reviews per place, sorted by relevance on the new Places API.
+- The CLI always returns JSON.
+- For reviews, the CLI keeps `originalText` and does not expose the localized `text` field.
