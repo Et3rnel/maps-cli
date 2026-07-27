@@ -38,6 +38,7 @@ jobs:
       - name: Install Rust toolchain
         uses: dtolnay/rust-toolchain@stable
         with:
+          components: clippy, rustfmt
           targets: ${{ matrix.target }}
 
       - name: Cache cargo registry and build outputs
@@ -52,7 +53,10 @@ jobs:
             ${{ runner.os }}-${{ matrix.target }}-cargo-
 
       - name: Run checks
-        run: just lint
+        run: |
+          cargo fmt --all -- --check
+          cargo check --all-targets
+          cargo clippy --all-targets --all-features -- -D warnings
 
       - name: Run tests
         run: cargo test --target "${{ matrix.target }}"
