@@ -4,6 +4,24 @@ CLI for Google Maps APIs (Places, Text Search, and more).
 
 ## Installation
 
+### macOS
+
+Download the binary for your Mac architecture and install it in `/usr/local/bin`:
+
+```bash
+case "$(uname -m)" in
+  arm64) asset="maps-cli-darwin-arm64" ;;
+  x86_64) asset="maps-cli-darwin-amd64" ;;
+  *) echo "Unsupported macOS architecture: $(uname -m)" >&2; exit 1 ;;
+esac
+
+curl -fL "https://github.com/Et3rnel/maps-cli/releases/latest/download/$asset" -o maps-cli
+sudo install -m 755 maps-cli /usr/local/bin/maps-cli
+rm maps-cli
+```
+
+### From source
+
 ```bash
 cargo install --path .
 ```
